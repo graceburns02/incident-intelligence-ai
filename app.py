@@ -146,8 +146,22 @@ if "analysis_results" in st.session_state:
             st.caption(f"Confidence: {r.root_cause.confidence_score}")
             with st.expander(f"Raw cluster inputs (debug) c{r.cluster_id}"):
                 st.json(st.session_state.grouped.get(r.cluster_id, []))
+            raw_debug = st.session_state.raw_outputs.get(r.cluster_id, {})
+            if isinstance(raw_debug, dict) and raw_debug.get("parse_errors"):
+                st.warning(f"Cluster {r.cluster_id}: parser needed manual fallback. Please review/edit output.")
             with st.expander(f"Raw model output (debug) c{r.cluster_id}"):
-                st.code(st.session_state.raw_outputs.get(r.cluster_id, ""))
+                if isinstance(raw_debug, dict):
+                    st.code(raw_debug.get("raw_response", ""))
+                else:
+                    st.code(raw_debug)
+            with st.expander(f"Parsing errors (debug) c{r.cluster_id}"):
+                if isinstance(raw_debug, dict):
+                    st.json({
+                        "used_repair": raw_debug.get("used_repair", False),
+                        "parse_errors": raw_debug.get("parse_errors", []),
+                    })
+                else:
+                    st.json({"used_repair": False, "parse_errors": []})
 
     st.header("6) Human Review")
     pending = [r for r in st.session_state.analysis_results if r.recommendation_status == "needs investigation"]
