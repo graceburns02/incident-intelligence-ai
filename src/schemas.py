@@ -27,26 +27,16 @@ class IncidentCluster(StrictBaseModel):
     representative_theme: Optional[str] = None
 
 
-class RootCauseAnalysis(StrictBaseModel):
-    likely_root_cause: Optional[str] = None
-    supporting_evidence: list[str] = Field(default_factory=list)
-    confidence_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-
-
-class RemediationAction(StrictBaseModel):
-    action: str
-    owner_team: Optional[str] = None
-    priority: Optional[Literal["low", "medium", "high", "critical"]] = None
-
-
 class ClusterAnalysisResult(StrictBaseModel):
     cluster_id: int
-    cluster_title: Optional[str] = None
-    issue_summary: Optional[str] = None
-    severity_assessment: Optional[str] = None
-    root_cause: RootCauseAnalysis = Field(default_factory=RootCauseAnalysis)
-    remediation_actions: list[RemediationAction] = Field(default_factory=list)
-    recommendation_status: Literal["accepted", "rejected", "needs investigation"] = "needs investigation"
+    cluster_title: str = "Untitled cluster"
+    issue_summary: str = ""
+    likely_root_cause: str = ""
+    supporting_evidence: list[str] = Field(default_factory=list)
+    recommended_actions: list[str] = Field(default_factory=list)
+    severity_assessment: str = "unknown"
+    confidence_score: float = Field(default=0.5, ge=0.0, le=1.0)
+    review_status: Literal["accepted", "needs_investigation", "rejected"] = "needs_investigation"
 
 
 class FullAnalysisReport(StrictBaseModel):

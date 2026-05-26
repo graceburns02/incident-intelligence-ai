@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections import defaultdict
 
@@ -10,6 +11,8 @@ from pydantic import ValidationError
 from src.schemas import ClusterAnalysisResult
 from src.utils import safe_json_loads
 
+logger = logging.getLogger(__name__)
+
 
 def group_incidents_by_cluster(df, labels):
     grouped = defaultdict(list)
@@ -18,21 +21,10 @@ def group_incidents_by_cluster(df, labels):
     return dict(grouped)
 
 
-def _schema_dict():
-    schema = ClusterAnalysisResult.model_json_schema()
-    schema["additionalProperties"] = False
-    if "$defs" in schema:
-        for v in schema["$defs"].values():
-            if isinstance(v, dict) and v.get("type") == "object":
-                v["additionalProperties"] = False
-    return schema
-
-
 def _extract_json_text(raw_text: str) -> str:
     text = (raw_text or "").strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"\s*```$", "", text).strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text).strip()
 
     decoder = json.JSONDecoder()
     for i, ch in enumerate(text):
@@ -46,39 +38,65 @@ def _extract_json_text(raw_text: str) -> str:
     return text
 
 
-def _request_cluster_analysis(client: OpenAI, model: str, prompt: str):
-    """
-    Compatibility note:
-    - Chat Completions historically used response_format/json schema options differently.
-    - Responses API currently supports structured outputs through text.format json_schema,
-      while older or mismatched SDK/server combinations may reject those params.
-    """
+def _status_from_confidence(confidence_score: float) -> str:
+    return "accepted" if confidence_score >= 0.75 else "needs_investigation"
+
+
+def _normalize_parsed_data(cluster_id: int, parsed_data: dict | None) -> dict:
+    parsed_data = dict(parsed_data or {})
+    parsed_data["cluster_id"] = cluster_id
+    parsed_data.setdefault("cluster_title", "Untitled cluster")
+    parsed_data.setdefault("issue_summary", "")
+    parsed_data.setdefault("likely_root_cause", "")
+    parsed_data.setdefault("severity_assessment", "unknown")
+    parsed_data.setdefault("supporting_evidence", [])
+    parsed_data.setdefault("recommended_actions", [])
+    parsed_data.setdefault("confidence_score", 0.5)
+
+    if not isinstance(parsed_data["supporting_evidence"], list):
+        parsed_data["supporting_evidence"] = [str(parsed_data["supporting_evidence"])]
+    if not isinstance(parsed_data["recommended_actions"], list):
+        parsed_data["recommended_actions"] = [str(parsed_data["recommended_actions"])]
+
     try:
-        return client.responses.create(
-            model=model,
-            input=prompt,
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "cluster_analysis_result",
-                    "schema": _schema_dict(),
-                    "strict": True,
-                }
-            },
-        )
-    except TypeError:
-        # SDK/version incompatibility fallback: prompt-only JSON generation.
-        return client.responses.create(
-            model=model,
-            input=prompt + "\nReturn JSON only that matches ClusterAnalysisResult schema.",
-        )
+        parsed_data["confidence_score"] = float(parsed_data["confidence_score"])
+    except Exception:
+        parsed_data["confidence_score"] = 0.5
+
+    parsed_data["review_status"] = _status_from_confidence(parsed_data["confidence_score"])
+    return parsed_data
+
+
+def _chat_completion(client: OpenAI, model: str, prompt: str, method_label: str = "analysis") -> str:
+    logger.info("cluster_analysis request model=%s method=chat.completions purpose=%s", model, method_label)
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": "You are an operations analyst. Return only valid JSON. No markdown. No commentary."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+    )
+    raw_output = (response.choices[0].message.content or "").strip()
+    logger.info("cluster_analysis raw_response purpose=%s: %s", method_label, raw_output)
+    return raw_output
 
 
 def analyze_cluster_with_llm(client: OpenAI, cluster_id: int, incidents: list[dict], model: str):
+    schema_example = {
+        "cluster_id": cluster_id,
+        "cluster_title": "Authentication timeouts in checkout",
+        "issue_summary": "Checkout API is timing out for a subset of users during peak windows.",
+        "likely_root_cause": "Connection pool exhaustion after recent config change.",
+        "supporting_evidence": ["Spike in timeout errors after 14:00 UTC", "DB connections saturated at 100%"],
+        "recommended_actions": ["Roll back pool size config", "Add alert for pool saturation"],
+        "severity_assessment": "high",
+        "confidence_score": 0.82,
+        "review_status": "accepted",
+    }
     prompt = (
-        "You are an incident intelligence assistant for operations teams. "
-        "Provide decision support with evidence and uncertainty. "
-        "Output strict JSON only, no markdown fences, no prose. "
+        "Analyze the incident cluster and return JSON matching this exact schema and field names only:\n"
+        f"{json.dumps(schema_example, indent=2)}\n\n"
         f"Cluster ID: {cluster_id}\nIncidents:\n{json.dumps(incidents, indent=2)}"
     )
 
@@ -86,42 +104,46 @@ def analyze_cluster_with_llm(client: OpenAI, cluster_id: int, incidents: list[di
     parse_errors: list[str] = []
     used_repair = False
     try:
-        resp = _request_cluster_analysis(client, model, prompt)
-        raw_output = getattr(resp, "output_text", "") or ""
+        raw_output = _chat_completion(client, model, prompt)
     except Exception as e:
+        logger.exception("cluster_analysis exception during primary request")
         parse_errors.append(f"OpenAI request failed: {e}")
         fallback = ClusterAnalysisResult(cluster_id=cluster_id, issue_summary="Manual review required due to model request failure.")
-        return fallback, {"raw_response": raw_output, "parse_errors": parse_errors, "used_repair": used_repair}
+        return fallback, {"raw_response": raw_output, "parse_errors": parse_errors, "used_repair": used_repair, "used_fallback": True}
 
     parsed_data = None
-    json_text = _extract_json_text(raw_output)
     try:
-        parsed_data = safe_json_loads(json_text)
+        parsed_data = safe_json_loads(_extract_json_text(raw_output))
     except Exception as e:
+        logger.exception("cluster_analysis parse failure")
         parse_errors.append(f"Initial JSON parse failed: {e}")
 
     if parsed_data is None:
         used_repair = True
         repair_prompt = (
-            "Repair the following content into valid JSON only that matches the ClusterAnalysisResult schema. "
-            "Do not include markdown or explanation.\n\n"
-            f"Original content:\n{raw_output}"
+            "Convert the following text into valid JSON matching this schema exactly.\n"
+            f"{json.dumps(schema_example, indent=2)}\n\n"
+            f"Text:\n{raw_output}"
         )
         try:
-            repair_resp = client.responses.create(model=model, input=repair_prompt)
-            repair_raw = getattr(repair_resp, "output_text", "") or ""
+            repair_raw = _chat_completion(client, model, repair_prompt, method_label="repair")
             raw_output = raw_output + "\n\n--- JSON_REPAIR_ATTEMPT ---\n" + repair_raw
             parsed_data = safe_json_loads(_extract_json_text(repair_raw))
         except Exception as e:
+            logger.exception("cluster_analysis repair failure")
             parse_errors.append(f"Repair attempt failed: {e}")
 
     try:
-        parsed = ClusterAnalysisResult.model_validate(parsed_data or {})
+        normalized = _normalize_parsed_data(cluster_id, parsed_data)
+        parsed = ClusterAnalysisResult.model_validate(normalized)
     except ValidationError as e:
+        logger.exception("cluster_analysis validation failure")
         parse_errors.append(f"Schema validation failed: {e}")
-        parsed = ClusterAnalysisResult(cluster_id=cluster_id, issue_summary="Manual review required due to parsing failure.")
+        fallback = ClusterAnalysisResult(cluster_id=cluster_id, issue_summary="Manual review required due to parsing failure.")
+        return fallback, {"raw_response": raw_output, "parse_errors": parse_errors, "used_repair": used_repair, "used_fallback": True}
 
-    return parsed, {"raw_response": raw_output, "parse_errors": parse_errors, "used_repair": used_repair}
+    logger.info("cluster_analysis validation passed cluster_id=%s", cluster_id)
+    return parsed, {"raw_response": raw_output, "parse_errors": parse_errors, "used_repair": used_repair, "used_fallback": False}
 
 
 def analyze_clusters(df, labels, api_key: str, model: str = "gpt-4.1-mini"):
@@ -131,8 +153,6 @@ def analyze_clusters(df, labels, api_key: str, model: str = "gpt-4.1-mini"):
     raw = {}
     for cid, incidents in grouped.items():
         parsed, raw_output = analyze_cluster_with_llm(client, cid, incidents, model)
-        if parsed.cluster_id != cid:
-            parsed.cluster_id = cid
         results.append(parsed)
         raw[cid] = raw_output
     return results, grouped, raw

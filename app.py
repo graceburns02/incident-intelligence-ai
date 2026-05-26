@@ -29,13 +29,23 @@ with st.sidebar:
 6. Export reports.
 """)
 
+
 api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
 model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+fallback_model = os.getenv("OPENAI_FALLBACK_MODEL", "gpt-4o-mini")
 embedding_model = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 
 st.header("1) Upload / Sample Data")
+use_deterministic_demo = st.toggle("Use deterministic demo mode", value=False, help="Uses prewritten sample analysis without API calls.")
 use_sample = st.toggle("Use sample dataset", value=True)
 uploaded = st.file_uploader("Upload incidents CSV", type=["csv"])
+
+with st.sidebar:
+    st.header("Runtime")
+    st.write(f"Analysis model: `{model}`")
+    st.write(f"Embedding model: `{embedding_model}`")
+    st.write(f"Demo mode: {'On' if use_deterministic_demo else 'Off'}")
+    st.write(f"API key configured: {'Yes' if api_key else 'No'}")
 
 try:
     df = load_sample_dataset() if use_sample else (load_incidents_csv(uploaded) if uploaded else None)
@@ -96,7 +106,7 @@ n_clusters = st.slider("Number of clusters", min_value=2, max_value=min(12, len(
 run = st.button("Run incident intelligence workflow", type="primary")
 
 if run:
-    if not api_key:
+    if not api_key and not use_deterministic_demo:
         st.error("Missing API key. Set OPENAI_API_KEY in Streamlit secrets or environment variables.")
         st.stop()
     texts = build_embedding_texts(mapped.to_dict(orient="records"))
@@ -112,12 +122,28 @@ if run:
 
     st.plotly_chart(px.histogram(mapped, x="cluster_id", title="Cluster sizes"), use_container_width=True)
 
-    try:
-        results, grouped, raw_outputs = analyze_clusters(mapped, labels, api_key=api_key, model=model)
-    except (AuthenticationError, RateLimitError, APIError) as e:
-        st.error(f"OpenAI API error: {e}")
-        st.info("Fallback mode enabled: you can still review clusters manually.")
-        results, grouped, raw_outputs = [], {}, {}
+    if use_deterministic_demo:
+        grouped = {}
+        for idx, row in mapped.iterrows():
+            grouped.setdefault(int(labels[idx]), []).append(row.to_dict())
+        from src.schemas import ClusterAnalysisResult
+        results = [
+            ClusterAnalysisResult(cluster_id=cid, cluster_title=f"Demo Cluster {cid}", issue_summary="Deterministic demo analysis output.", likely_root_cause="Synthetic example root cause for demo.", supporting_evidence=["Demo evidence point"], recommended_actions=["Demo action"], severity_assessment="medium", confidence_score=0.8, review_status="accepted")
+            for cid in sorted(grouped.keys())
+        ]
+        raw_outputs = {cid: {"raw_response": "DEMO_MODE", "parse_errors": [], "used_repair": False, "used_fallback": False} for cid in grouped.keys()}
+        st.info("Deterministic demo mode enabled: using prewritten sample generated analysis.")
+    else:
+        try:
+            results, grouped, raw_outputs = analyze_clusters(mapped, labels, api_key=api_key, model=model)
+        except (AuthenticationError, RateLimitError, APIError) as e:
+            if model != fallback_model:
+                st.warning(f"Primary model failed ({model}): {e}. Retrying with {fallback_model}.")
+                results, grouped, raw_outputs = analyze_clusters(mapped, labels, api_key=api_key, model=fallback_model)
+            else:
+                st.error(f"OpenAI API error: {e}")
+                st.info("Fallback mode enabled: you can still review clusters manually.")
+                results, grouped, raw_outputs = [], {}, {}
 
     st.session_state.analysis_results = results
     st.session_state.grouped = grouped
@@ -130,24 +156,24 @@ if "analysis_results" in st.session_state:
             st.subheader(f"Cluster {r.cluster_id}: {r.cluster_title or 'Untitled cluster'}")
             st.write(r.issue_summary)
             st.write(f"**AI Root cause (editable):**")
-            r.root_cause.likely_root_cause = st.text_area(f"Root cause c{r.cluster_id}", value=r.root_cause.likely_root_cause or "", key=f"rc_{r.cluster_id}")
-            rem_text = "\n".join([a.action for a in r.remediation_actions])
+            r.likely_root_cause = st.text_area(f"Root cause c{r.cluster_id}", value=r.likely_root_cause or "", key=f"rc_{r.cluster_id}")
+            rem_text = "\n".join(r.recommended_actions)
             edited_rem = st.text_area(f"Remediation c{r.cluster_id}", value=rem_text, key=f"rem_{r.cluster_id}")
-            r.remediation_actions = [{"action": line.strip()} for line in edited_rem.split("\n") if line.strip()]
-            r.recommendation_status = st.selectbox(
+            r.recommended_actions = [line.strip() for line in edited_rem.split("\n") if line.strip()]
+            r.review_status = st.selectbox(
                 f"Decision c{r.cluster_id}",
-                ["accepted", "rejected", "needs investigation"],
-                index=["accepted", "rejected", "needs investigation"].index(r.recommendation_status),
+                ["accepted", "rejected", "needs_investigation"],
+                index=["accepted", "rejected", "needs_investigation"].index(r.review_status),
                 key=f"status_{r.cluster_id}",
             )
             st.write("**Evidence**")
-            for ev in r.root_cause.supporting_evidence:
+            for ev in r.supporting_evidence:
                 st.markdown(f"- {ev}")
-            st.caption(f"Confidence: {r.root_cause.confidence_score}")
+            st.caption(f"Confidence: {r.confidence_score}")
             with st.expander(f"Raw cluster inputs (debug) c{r.cluster_id}"):
                 st.json(st.session_state.grouped.get(r.cluster_id, []))
             raw_debug = st.session_state.raw_outputs.get(r.cluster_id, {})
-            if isinstance(raw_debug, dict) and raw_debug.get("parse_errors"):
+            if isinstance(raw_debug, dict) and raw_debug.get("used_fallback"):
                 st.warning(f"Cluster {r.cluster_id}: parser needed manual fallback. Please review/edit output.")
             with st.expander(f"Raw model output (debug) c{r.cluster_id}"):
                 if isinstance(raw_debug, dict):
@@ -164,7 +190,7 @@ if "analysis_results" in st.session_state:
                     st.json({"used_repair": False, "parse_errors": []})
 
     st.header("6) Human Review")
-    pending = [r for r in st.session_state.analysis_results if r.recommendation_status == "needs investigation"]
+    pending = [r for r in st.session_state.analysis_results if r.review_status == "needs_investigation"]
     if pending:
         st.warning(f"{len(pending)} clusters still marked as needs investigation.")
     else:
