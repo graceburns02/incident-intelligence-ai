@@ -3,7 +3,7 @@
 **One-line description:** AI-assisted incident intelligence workspace that clusters operational incidents and supports evidence-based root cause decisions with human review.
 
 ## Live Demo
-- Streamlit Community Cloud: _[Add deployment URL]_
+- Streamlit Community Cloud: https://incident-intelligence-ai.streamlit.app/
 
 ## Problem Statement
 Operational teams receive fragmented incidents/tickets across systems. Signal gets buried in noise, causing slower triage and inconsistent remediation decisions.
